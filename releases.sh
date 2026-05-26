@@ -3,23 +3,25 @@ set -euo pipefail
 
 # Usage: ./releases.sh [options] <github-owner> [output-file]
 # Generates an HTML report of download stats for all projects found in
-# the owner's homebrew-tap and scoop-bucket repos.
+# the owner's Homebrew taps and Scoop buckets.
 #
 # Options:
-#   --tap <repo>     Homebrew tap repo name (default: homebrew-tap)
-#   --bucket <repo>  Scoop bucket repo name (default: scoop-bucket)
+#   --tap <repo>     Homebrew tap repo name (repeatable; skips auto-discovery)
+#   --bucket <repo>  Scoop bucket repo name (repeatable; skips auto-discovery)
+#
+# By default, discovers all homebrew-* and scoop-* repos for the owner.
 #
 # Requires: curl, jq
 # Optional: GITHUB_TOKEN env var for authenticated API requests
 
-TAP_REPO="homebrew-tap"
-BUCKET_REPO="scoop-bucket"
+declare -a TAP_REPOS=()
+declare -a BUCKET_REPOS=()
 
 # Parse options
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
-    --tap)    TAP_REPO="$2"; shift 2 ;;
-    --bucket) BUCKET_REPO="$2"; shift 2 ;;
+    --tap)    TAP_REPOS+=("$2"); shift 2 ;;
+    --bucket) BUCKET_REPOS+=("$2"); shift 2 ;;
     *)        echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -31,8 +33,8 @@ if [ -z "$GITHUB_OWNER" ]; then
   echo "Usage: $0 [options] <github-owner> [output-file]" >&2
   echo "" >&2
   echo "Options:" >&2
-  echo "  --tap <repo>     Homebrew tap repo name (default: homebrew-tap)" >&2
-  echo "  --bucket <repo>  Scoop bucket repo name (default: scoop-bucket)" >&2
+  echo "  --tap <repo>     Homebrew tap repo name (repeatable; skips auto-discovery)" >&2
+  echo "  --bucket <repo>  Scoop bucket repo name (repeatable; skips auto-discovery)" >&2
   exit 1
 fi
 
@@ -97,21 +99,74 @@ format_date() {
     || echo "$iso_date"
 }
 
-# --- Discover projects ---
+# --- Discover tap/bucket repos ---
+
+# Auto-discover if no explicit --tap or --bucket flags were given
+if [ ${#TAP_REPOS[@]} -eq 0 ] && [ ${#BUCKET_REPOS[@]} -eq 0 ]; then
+  echo "Auto-discovering homebrew-* and scoop-* repos for $GITHUB_OWNER..." >&2
+  for prefix in homebrew scoop; do
+    # user: works for personal accounts, org: works for organizations — try both
+    search_json=$(cached_fetch "$API_BASE/search/repositories?q=${prefix}+in:name+user:${GITHUB_OWNER}&per_page=100" 2>/dev/null) || true
+    result_count=$(echo "$search_json" | jq '.total_count // 0' 2>/dev/null)
+    if [ "${result_count:-0}" -eq 0 ]; then
+      search_json=$(cached_fetch "$API_BASE/search/repositories?q=${prefix}+in:name+org:${GITHUB_OWNER}&per_page=100" 2>/dev/null) || continue
+    fi
+    while IFS= read -r name; do
+      [ -z "$name" ] && continue
+      if [[ "$name" == homebrew-* ]]; then
+        TAP_REPOS+=("$name")
+      elif [[ "$name" == scoop-* ]]; then
+        BUCKET_REPOS+=("$name")
+      fi
+    done < <(echo "$search_json" | jq -r '.items[].name')
+  done
+fi
+
+if [ ${#TAP_REPOS[@]} -eq 0 ] && [ ${#BUCKET_REPOS[@]} -eq 0 ]; then
+  echo "No homebrew-* or scoop-* repos found for $GITHUB_OWNER" >&2
+  exit 1
+fi
+
+[ ${#TAP_REPOS[@]} -gt 0 ] && echo "Tap repos: ${TAP_REPOS[*]}" >&2
+[ ${#BUCKET_REPOS[@]} -gt 0 ] && echo "Bucket repos: ${BUCKET_REPOS[*]}" >&2
+
+# --- Discover projects from taps and buckets ---
 
 homebrew_projects=""
+for tap in "${TAP_REPOS[@]}"; do
+  # Try Formula/ subdirectory first, then repo root
+  found=$(cached_fetch "$API_BASE/repos/$GITHUB_OWNER/$tap/contents/Formula" 2>/dev/null \
+    | jq -r '.[].name | select(endswith(".rb")) | rtrimstr(".rb")') || true
+  if [ -z "$found" ]; then
+    found=$(cached_fetch "$API_BASE/repos/$GITHUB_OWNER/$tap/contents/" 2>/dev/null \
+      | jq -r '.[].name | select(endswith(".rb")) | rtrimstr(".rb")') || true
+  fi
+  if [ -z "$found" ]; then
+    # Single-project tap: derive project name from repo name (strip "homebrew-" prefix)
+    project_name="${tap#homebrew-}"
+    # Verify the repo actually exists
+    if cached_fetch "$API_BASE/repos/$GITHUB_OWNER/$project_name" >/dev/null 2>&1; then
+      found="$project_name"
+    fi
+  fi
+  if [ -n "$found" ]; then
+    homebrew_projects=$(printf '%s\n%s' "$homebrew_projects" "$found")
+  fi
+done
+
 scoop_projects=""
-
-homebrew_projects=$(cached_fetch "$API_BASE/repos/$GITHUB_OWNER/$TAP_REPO/contents/Formula" 2>/dev/null \
-  | jq -r '.[].name | select(endswith(".rb")) | rtrimstr(".rb")') || true
-
-scoop_projects=$(cached_fetch "$API_BASE/repos/$GITHUB_OWNER/$BUCKET_REPO/contents/" 2>/dev/null \
-  | jq -r '.[].name | select(endswith(".json")) | rtrimstr(".json")') || true
+for bucket in "${BUCKET_REPOS[@]}"; do
+  found=$(cached_fetch "$API_BASE/repos/$GITHUB_OWNER/$bucket/contents/" 2>/dev/null \
+    | jq -r '.[].name | select(endswith(".json")) | rtrimstr(".json")') || true
+  if [ -n "$found" ]; then
+    scoop_projects=$(printf '%s\n%s' "$scoop_projects" "$found")
+  fi
+done
 
 projects=$(printf '%s\n%s' "$homebrew_projects" "$scoop_projects" | grep -v '^$' | sort -u)
 
 if [ -z "$projects" ]; then
-  echo "No projects found in $TAP_REPO or $BUCKET_REPO for $GITHUB_OWNER" >&2
+  echo "No projects found in any discovered taps or buckets for $GITHUB_OWNER" >&2
   exit 1
 fi
 
